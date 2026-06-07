@@ -25,9 +25,22 @@
 //          - Rightmost: Replace first the Non-Terminal that is closest to the right
 //              - These are "hard" to program, see Yacc and Bison
 
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Support/Error.h"
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Value.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/PassManager.h>
+#include <llvm/Passes/PassBuilder.h>
+#include "llvm/Passes/StandardInstrumentations.h"
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar/Reassociate.h>
+#include <llvm/Transforms/Scalar/GVN.h>
+#include <llvm/Transforms/Scalar/SimplifyCFG.h>
+#include <llvm/Analysis/LoopAnalysisManager.h>
+#include <llvm/Analysis/CGSCCPassManager.h>
 #include <iostream>
 #include <cassert>
 #include <map>
@@ -36,6 +49,7 @@
 #include <vector>
 #include <filesystem>
 #include <fstream>
+#include "KaleidoscopeJIT.h"
 
 /////////////////////////////////////////////
 ////////////// LLVM related //////////////
@@ -46,6 +60,23 @@ static std::unique_ptr<llvm::LLVMContext> TheContext;
 static std::unique_ptr<llvm::IRBuilder<>> Builder;
 static std::unique_ptr<llvm::Module> TheModule;
 static std::map<std::string, llvm::Value*> NamedValues;
+
+static std::unique_ptr<llvm::LoopAnalysisManager> TheLoopAnalysisManager;
+static std::unique_ptr<llvm::FunctionAnalysisManager> TheFunctionAnalysisManager;
+static std::unique_ptr<llvm::CGSCCAnalysisManager> TheCallGraphAnalysisManager;
+static std::unique_ptr<llvm::ModuleAnalysisManager> TheModuleAnalysisManager;
+static std::unique_ptr<llvm::FunctionPassManager> TheFunctionPassManager;
+
+
+// For logging
+static std::unique_ptr<llvm::PassInstrumentationCallbacks> ThePassInstrumentationCallback;
+static std::unique_ptr<llvm::StandardInstrumentations> TheStandardInstrumentation;
+
+// Define a global wrapper instance
+static llvm::ExitOnError ExitOnErr;
+
+static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
+static std::map<std::string, std::unique_ptr<class PrototypeAST>> FunctionProtos; // This was intended for having multiple re-definitions of the function but is no longer valid technique as per the tutorial, removing as it just ocmplicates the cod
 
 /////////////////////////////////////////////
 ////////////// Lexer (Scanner) //////////////
@@ -278,6 +309,8 @@ public:
     }
 };
 
+llvm::Function* GetFunction(const std::string& Name);
+
 /// Expression class representing a function invocation 
 class CallExpressionAST final : public ExpressionAST
 {
@@ -294,8 +327,12 @@ public:
     
     llvm::Value* CodeGen() override
     {
+        // Each function it's in their own module, find last module where a fun was defined
+        llvm::Function* CalleeF = GetFunction(Callee);
+        
         // Look up the name in the global module table.
-        llvm::Function *CalleeF = TheModule->getFunction(Callee);
+        // llvm::Function *CalleeF = TheModule->getFunction(Callee);
+
         if (!CalleeF)
         {
             return LogErrorV("Unknown function referenced");
@@ -317,7 +354,7 @@ public:
             }
         }
 
-        return Builder->CreateCall(CalleeF, ArgsV, "calltmp");
+        return Builder->CreateCall(CalleeF, ArgsV, "CallTmp");
     }
 };
 
@@ -388,18 +425,12 @@ public:
     {}
 
     [[nodiscard]] llvm::Function* CodeGen() const
-    {
+    {        
         // First, check for an existing function from a previous 'extern' declaration.
         llvm::Function* TheFunction = TheModule->getFunction(Proto->GetName());
-
         if (!TheFunction)
         {
             TheFunction = Proto->CodeGen();
-        }
-
-        if (!TheFunction)
-        {
-            return nullptr;            
         }
 
         if (!TheFunction->empty())
@@ -421,12 +452,16 @@ public:
             NamedValues[std::string(Arg.getName())] = &Arg;
         }
 
-        if (llvm::Value* RetVal = Body->CodeGen()) {
+        if (llvm::Value* RetVal = Body->CodeGen())
+        {
             // Finish off the function.
             Builder->CreateRet(RetVal);
 
             // Validate the generated code, checking for consistency.
             // VerifyFunction(*TheFunction);
+
+            // Optimize the generated IL code
+            TheFunctionPassManager->run(*TheFunction, *TheFunctionAnalysisManager);
 
             return TheFunction;
         }
@@ -436,6 +471,22 @@ public:
         return nullptr;
     }
 };
+
+llvm::Function* GetFunction(const std::string& Name)
+{
+    // First, see if the function has already been added to the current module.
+    if (auto* Function = TheModule->getFunction(Name))
+        return Function;
+
+    // If not, check whether we can codegen the declaration from some existing
+    // prototype.
+    auto FunctionPrototype = FunctionProtos.find(Name);
+    if (FunctionPrototype != FunctionProtos.end())
+        return FunctionPrototype->second->CodeGen();
+
+    // If no existing prototype exists, return null.
+    return nullptr;
+}
 
 std::unique_ptr<ExpressionAST> LogError(const char* Str)
 {
@@ -778,6 +829,59 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr()
     return nullptr;
 }
 
+static void InitializeModuleAndManagers()
+{
+    // Open a new context and module.
+    TheContext = std::make_unique<llvm::LLVMContext>();
+    TheModule = std::make_unique<llvm::Module>("My cool jit", *TheContext);
+    TheModule->setDataLayout(TheJIT->getDataLayout());
+
+    // Create a new builder for the module.
+    Builder = std::make_unique<llvm::IRBuilder<>>(*TheContext);
+
+    // https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl04.html
+    // https://llvm.org/docs/NewPassManager.html#id2
+    // Create the analysis managers.
+    // These must be declared in this order so that they are destroyed in the
+    // correct order due to inter-analysis-manager references.
+    TheLoopAnalysisManager = std::make_unique<llvm::LoopAnalysisManager>();
+    TheFunctionAnalysisManager = std::make_unique<llvm::FunctionAnalysisManager>();
+    TheCallGraphAnalysisManager = std::make_unique<llvm::CGSCCAnalysisManager>();
+    TheModuleAnalysisManager = std::make_unique<llvm::ModuleAnalysisManager>();
+
+    // For logging
+    ThePassInstrumentationCallback = std::make_unique<llvm::PassInstrumentationCallbacks>();
+    TheStandardInstrumentation = std::make_unique<llvm::StandardInstrumentations>(*TheContext, /*DebugLogging*/ true);
+    TheStandardInstrumentation->registerCallbacks(*ThePassInstrumentationCallback, TheModuleAnalysisManager.get());
+    
+    // Create the new pass manager builder.
+    // Take a look at the PassBuilder constructor parameters for more
+    // customization, e.g. specifying a TargetMachine or various debugging options.
+    llvm::PassBuilder PassBuilder(nullptr, llvm::PipelineTuningOptions(), std::nullopt, ThePassInstrumentationCallback.get());
+
+    // Register all the basic analyses with the managers.
+    PassBuilder.registerLoopAnalyses(*TheLoopAnalysisManager);
+    PassBuilder.registerFunctionAnalyses(*TheFunctionAnalysisManager);
+    PassBuilder.registerCGSCCAnalyses(*TheCallGraphAnalysisManager);
+    PassBuilder.registerModuleAnalyses(*TheModuleAnalysisManager);
+    PassBuilder.crossRegisterProxies(*TheLoopAnalysisManager, *TheFunctionAnalysisManager, *TheCallGraphAnalysisManager, *TheModuleAnalysisManager);
+    
+    
+    // This FunctionPassManager pipeline could have been built from the PassBuilder above
+    TheFunctionPassManager = std::make_unique<llvm::FunctionPassManager>();
+    
+    // Add transform passes.
+    // Do simple "peephole" optimizations and bit-twiddling options.
+    TheFunctionPassManager->addPass(llvm::InstCombinePass());
+    // Reassociate expressions.
+    TheFunctionPassManager->addPass(llvm::ReassociatePass());
+    // Eliminate Common SubExpressions.
+    TheFunctionPassManager->addPass(llvm::GVNPass());
+    // Simplify the control flow graph (deleting unreachable blocks, etc...).
+    TheFunctionPassManager->addPass(llvm::SimplifyCFGPass());
+
+}
+
 /**
  * Romu> The starting symbol of the grammar
  * Top
@@ -825,25 +929,56 @@ static void MainLoop()
 
         if (const auto TopLevelExpressionAST = ParseTopLevelExpr())
         {
-            TopLevelExpressionAST->CodeGen()->print( llvm::outs());
-            llvm::outs().flush();
+            if (llvm::Function* Function = TopLevelExpressionAST->CodeGen())
+            {
+                Function->print( llvm::outs());
+                llvm::outs().flush();
+
+                // Create a ResourceTracker to track JIT'd memory allocated to our
+                // anonymous expression -- that way we can free it after executing.
+                auto ResourceTracker = TheJIT->getMainJITDylib().createResourceTracker();
+
+                auto ThreadSafeModule = llvm::orc::ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+                ExitOnErr(TheJIT->addModule(std::move(ThreadSafeModule), ResourceTracker));
+                InitializeModuleAndManagers();
+
+                // Search the JIT for the __anon_expr symbol.
+                auto ExprSymbol = ExitOnErr(TheJIT->lookup("__AnonymousExpression"));
+
+                // Get the symbol's address and cast it to the right type (takes no
+                // arguments, returns a double) so we can call it as a native function.
+                double (*FP)() = ExprSymbol.toPtr<double (*)()>();
+                fprintf(stdout, "Evaluated to %f\n", FP());
+                fflush(stdout);
+
+                // Delete the anonymous expression module from the JIT.
+                ExitOnErr(ResourceTracker->remove());
+            }
+            
         }
     }
 }
 
-static void InitializeModule()
-{
-    // Open a new context and module.
-    TheContext = std::make_unique<llvm::LLVMContext>();
-    TheModule = std::make_unique<llvm::Module>("My cool jit", *TheContext);
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
 
-    // Create a new builder for the module.
-    Builder = std::make_unique<llvm::IRBuilder<>>(*TheContext);
+/// putchard - putchar that takes a double and returns 0.
+extern "C" DLLEXPORT double putchard(double X) {
+    fputc((char)X, stderr);
+    return 0;
 }
 
 int main()
 {
-    InitializeModule();
+    // Initialize the target registry and code generation components for the host
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmPrinter();
+    llvm::InitializeNativeTargetAsmParser(); // Optional: if you parse inline/target asm
+    TheJIT = ExitOnErr(llvm::orc::KaleidoscopeJIT::Create());
+    InitializeModuleAndManagers();
     MainLoop();
     return 0;
 }

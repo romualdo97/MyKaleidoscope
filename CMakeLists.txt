@@ -14,7 +14,7 @@ find_package(LLVM REQUIRED CONFIG)
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
-add_executable(MyKaleidoscope main.cpp)
+add_executable(MyKaleidoscope main.cpp KaleidoscopeJIT.h)
 
 # Find the libraries that correspond to the LLVM components
 # that we wish to use
