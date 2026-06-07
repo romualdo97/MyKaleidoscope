@@ -34,11 +34,14 @@
 #include <memory>
 #include <variant>
 #include <vector>
+#include <filesystem>
+#include <fstream>
 
 /////////////////////////////////////////////
 ////////////// LLVM related //////////////
 /////////////////////////////////////////////
 
+static std::ifstream SourceCode;
 static std::unique_ptr<llvm::LLVMContext> TheContext;
 static std::unique_ptr<llvm::IRBuilder<>> Builder;
 static std::unique_ptr<llvm::Module> TheModule;
@@ -48,8 +51,8 @@ static std::map<std::string, llvm::Value*> NamedValues;
 ////////////// Lexer (Scanner) //////////////
 /////////////////////////////////////////////
 
-// The lexer returns tokens [0-255] if it is an unknown character, otherwise one
-// of these for known things.
+/// The lexer returns tokens [0-255] if it is an unknown character, otherwise one
+/// of these for known things.
 enum class TokenType : char
 {
     EndOfFile = 0,
@@ -96,7 +99,7 @@ static char GetNextChar()
     return static_cast<char>(Character);
 }
 
-// Return the next token from standard input.
+/// Return the next token from standard input.
 static TokenOrAsciiCharacter GetNextToken() // Lexer
 {
     // Find next not empty space
@@ -170,9 +173,9 @@ static TokenOrAsciiCharacter GetNextToken() // Lexer
     return ThisChar;
 }
 
-// Provide a simple token buffer.  CurrentToken is the current
-// token the parser is looking at.  AdvanceToken reads another token from the
-// lexer and updates CurrentToken with its results.
+/// Provide a simple token buffer.  CurrentToken is the current
+/// token the parser is looking at.  AdvanceToken reads another token from the
+/// lexer and updates CurrentToken with its results.
 static TokenOrAsciiCharacter CurrentToken;
 static TokenOrAsciiCharacter AdvanceToNextToken()
 {
@@ -183,11 +186,9 @@ static TokenOrAsciiCharacter AdvanceToNextToken()
 //////// Abstract Syntax Tree tpes //////////
 /////////////////////////////////////////////
 
-
-
 llvm::Value* LogErrorV(const char* Str);
 
-// Base class for all expression nodes.
+/// Base class for all expression nodes.
 class ExpressionAST
 {
 public:
@@ -195,7 +196,7 @@ public:
     virtual llvm::Value* CodeGen() = 0; // Generates IR for LLVM, see: https://llvm.org/doxygen/classllvm_1_1Value.html
 };
 
-// Expression class for numeric literals like "1.0".
+/// Expression class for numeric literals like "1.0".
 class NumberExpressionAST final : public ExpressionAST
 {
     double Value;
@@ -210,7 +211,7 @@ public:
     }
 };
 
-// Expression class for referencing a variable, like "a".
+/// Expression class for referencing a variable, like "a".
 class VariableExpressionAST final : public ExpressionAST
 {
     std::string Name;
@@ -232,7 +233,7 @@ class VariableExpressionAST final : public ExpressionAST
     }
 };
 
-// Expression class representing a binary operation like a + b
+/// Expression class representing a binary operation like a + b
 class BinaryExpressionAST final : public ExpressionAST
 {
     char Operator;
@@ -277,7 +278,7 @@ public:
     }
 };
 
-// Expression class representing a function invocation 
+/// Expression class representing a function invocation 
 class CallExpressionAST final : public ExpressionAST
 {
     std::string Callee; // Name of the function being called / invoked
@@ -362,7 +363,9 @@ public:
         // Set names for all arguments.
         unsigned Idx = 0;
         for (auto& Arg : Function->args())
+        {
             Arg.setName(Args[Idx++]);
+        }
 
         return Function;
     }
@@ -418,7 +421,7 @@ public:
             NamedValues[std::string(Arg.getName())] = &Arg;
         }
 
-        if (llvm::Value *RetVal = Body->CodeGen()) {
+        if (llvm::Value* RetVal = Body->CodeGen()) {
             // Finish off the function.
             Builder->CreateRet(RetVal);
 
@@ -462,10 +465,14 @@ llvm::Value* LogErrorV(const char* Str)
 
 static std::unique_ptr<ExpressionAST> ParsePrimaryExpression();
 static std::unique_ptr<ExpressionAST> ParseExpression();
-static std::unique_ptr<ExpressionAST> ParsePrimaryExpression();
 static std::unique_ptr<ExpressionAST> ParseBinaryOperationRHS(int ExpressionPrecedence, std::unique_ptr<ExpressionAST> LeftHandSide);
 
 // NumberExpr ::= number
+
+/**
+ * Romu> Extract the number of the current token
+ * NumberExpr ::= number
+ */
 static std::unique_ptr<ExpressionAST> ParseNumberExpr()
 {
     // Parse number, assumes that the current token from the lexer is a number
@@ -474,7 +481,10 @@ static std::unique_ptr<ExpressionAST> ParseNumberExpr()
     return std::move(Node);
 }
 
-// ParenthesisExpr ::= '(' Expression ')'
+/**
+ * Romu> Represents an Expression wrapped by parenthesis, for example `(GetFooValue() + 7 * 2)`
+ * ParenthesisExpr ::= '(' Expression ')'
+ */
 static std::unique_ptr<ExpressionAST> ParseParenthesisExpr()
 {
     AdvanceToNextToken(); // eat (.
@@ -493,9 +503,12 @@ static std::unique_ptr<ExpressionAST> ParseParenthesisExpr()
     return Value;
 }
 
-// IdentifierExpr
-//   ::= identifier
-//   ::= identifier '(' Expression* ')'
+/**
+ * Romu> Represents the name of a variable or a function call
+ * IdentifierExpr
+ *     ::= identifier
+ *     ::= identifier '(' Expression* ')'
+ */
 static std::unique_ptr<ExpressionAST> ParseIdentifierExpr()
 {
     std::string NameId = IdentifierStr;
@@ -542,8 +555,9 @@ static std::unique_ptr<ExpressionAST> ParseIdentifierExpr()
     AdvanceToNextToken();
     return std::make_unique<CallExpressionAST>(std::move(NameId), std::move(Args));
 }
+// Operator precedence parsing
 
-// BinaryOpPrecedence - This holds the precedence for each binary operator that is  defined.
+// This holds the precedence for each binary operator that is  defined.
 static const std::map<char, int> BinaryOperatorPrecedence
 {
     { '<', 10 },
@@ -566,10 +580,11 @@ static int GetTokenPrecedence()
         : Found->second;
 }
 
-// Operator precedence parsing
-
-// Expression
-//   ::= PrimaryExpression BinaryOperationRHS
+/**
+ * Romu> Parses a PrimaryExpression optionally followed by a BinaryOperationRHS
+ * Expression
+ *     ::= PrimaryExpression BinaryOperationRHS
+ */
 static std::unique_ptr<ExpressionAST> ParseExpression()
 {
     auto LeftHandSide = ParsePrimaryExpression();
@@ -583,8 +598,11 @@ static std::unique_ptr<ExpressionAST> ParseExpression()
     return ParseBinaryOperationRHS(0, std::move(LeftHandSide));
 }
 
-// BinaryOperationRHS
-//   ::= ('+' Primary)*
+/**
+ * Romu> Receives the left hand side operand of a binary operation and check if a binary operator and an Expression is followed, if yes then return the AST node for the binary expression
+ * BinaryOperationRHS
+ *   ::= ('+' Expression)*
+ */
 static std::unique_ptr<ExpressionAST> ParseBinaryOperationRHS(int ExpressionPrecedence, std::unique_ptr<ExpressionAST> LeftHandSide)
 {
     // If this is a BinaryOperator, find its precedence.
@@ -617,8 +635,8 @@ static std::unique_ptr<ExpressionAST> ParseBinaryOperationRHS(int ExpressionPrec
 
         // If BinaryOperator binds less tightly with RHS than the operator after RHS, let
         // the pending operator take RHS as its LHS.
-        int NextPrecedence = GetTokenPrecedence();
-        if (TokenPrecedence < NextPrecedence)
+        if (const int NextPrecedence = GetTokenPrecedence();
+            TokenPrecedence < NextPrecedence)
         {
             RightHandSide = ParseBinaryOperationRHS(
                 TokenPrecedence + 1,
@@ -637,35 +655,41 @@ static std::unique_ptr<ExpressionAST> ParseBinaryOperationRHS(int ExpressionPrec
     }
 }
 
-// PrimaryExpression
-//   ::= IdentifierExpr
-//   ::= NumberExpr
-//   ::= ParenthesisExpr
+/**
+ * Romu> Name of variable or function, a number or an expression wrapped by parenthesis 
+ * PrimaryExpression
+ *   ::= IdentifierExpr
+ *   ::= NumberExpr
+ *   ::= ParenthesisExpr
+ */
 static std::unique_ptr<ExpressionAST> ParsePrimaryExpression()
 {
     if (IsToken(CurrentToken, TokenType::Identifier))
     {
         return ParseIdentifierExpr();
     }
-    
+
     if (IsToken(CurrentToken, TokenType::Number))
     {
         return ParseNumberExpr();
     }
-    
+
     if (IsToken(CurrentToken, '('))
     {
         return ParseParenthesisExpr();
     }
 
-    return LogError("unknown token when expecting an expression");
+    return LogError("Unknown token when expecting an expression");
 }
 
-// Prototype
-//   ::= id '(' id* ')'
+/**
+ * Romu> Declares the prototype of the function, this indicates the function name and the name of the parameters
+ * Prototype
+ *     ::= id '(' id* ')'
+ */
 static std::unique_ptr<PrototypeAST> ParsePrototype()
 {
-    if (IsToken(CurrentToken, TokenType::Identifier))
+    if (!IsToken(CurrentToken, TokenType::Identifier))
     {
         return LogErrorP("Expected function name in prototype");
     }
@@ -683,30 +707,32 @@ static std::unique_ptr<PrototypeAST> ParsePrototype()
     while (IsToken(AdvanceToNextToken(), TokenType::Identifier))
     {
         ArgNames.push_back(std::move(IdentifierStr));
-    }
-    
-    if (!IsToken(CurrentToken, ')'))
-    {
-        return LogErrorP("Expected ')' in prototype");
+
+        if (const TokenOrAsciiCharacter NextToken = AdvanceToNextToken();
+            IsToken(NextToken, ',') || IsToken(NextToken, ')'))
+        {
+            if (IsToken(NextToken, ')'))
+            {
+                break;
+            }
+        }
+        else
+        {
+            return LogErrorP("Unexpected token after parameter name, expected ',' or ')'");
+        }
     }
 
-    // Success.
-    AdvanceToNextToken();  // eat ')'.
+    // Success: Eat ')'
+    AdvanceToNextToken();
 
     return std::make_unique<PrototypeAST>(std::move(FnName), std::move(ArgNames));
 }
 
-static void InitializeModule()
-{
-    // Open a new context and module.
-    TheContext = std::make_unique<llvm::LLVMContext>();
-    TheModule = std::make_unique<llvm::Module>("my cool jit", *TheContext);
-
-    // Create a new builder for the module.
-    Builder = std::make_unique<llvm::IRBuilder<>>(*TheContext);
-}
-
-/// Definition ::= 'def' prototype expression
+/**
+ * Romu> Used to declare the prototype of a function followed by the function definition (an Expression).
+ * Definition
+ *    ::= 'def' Prototype Expression
+ */
 static std::unique_ptr<FunctionAST> ParseDefinition()
 {
     AdvanceToNextToken(); // eat def.
@@ -725,26 +751,38 @@ static std::unique_ptr<FunctionAST> ParseDefinition()
     return nullptr;
 }
 
-// External ::= 'extern' prototype
+/**
+ * Romu> Used to declare the prototype of a function that is defined externally (in another module)
+ * Definition
+ *    ::= 'extern'
+ */
 static std::unique_ptr<PrototypeAST> ParseExtern()
 {
     AdvanceToNextToken();  // eat extern.
     return ParsePrototype();
 }
 
-// TopLevelExpr ::= Expression
+/**
+ * Romu> Used to parse instructions that are not contained in a function, the compiler will wrap the Expression inside an anonymous function
+ * TopLevelExpr
+ *    ::= Expression
+ */
 static std::unique_ptr<FunctionAST> ParseTopLevelExpr()
 {
     if (auto Expression = ParseExpression())
     {
         // Make an anonymous proto.
-        auto Proto = std::make_unique<PrototypeAST>("__anon_expr", std::vector<std::string>());
+        auto Proto = std::make_unique<PrototypeAST>("__AnonymousExpression", std::vector<std::string>());
         return std::make_unique<FunctionAST>(std::move(Proto), std::move(Expression));
     }
     return nullptr;
 }
 
-/// Top ::= Definition | External | Expression | ';'
+/**
+ * Romu> The starting symbol of the grammar
+ * Top
+ *     ::= Definition | Extern | TopLevelExpr | ';'
+ */
 static void MainLoop()
 {
     while (true)
@@ -791,6 +829,16 @@ static void MainLoop()
             llvm::outs().flush();
         }
     }
+}
+
+static void InitializeModule()
+{
+    // Open a new context and module.
+    TheContext = std::make_unique<llvm::LLVMContext>();
+    TheModule = std::make_unique<llvm::Module>("My cool jit", *TheContext);
+
+    // Create a new builder for the module.
+    Builder = std::make_unique<llvm::IRBuilder<>>(*TheContext);
 }
 
 int main()
