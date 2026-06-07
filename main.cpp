@@ -25,13 +25,24 @@
 //          - Rightmost: Replace first the Non-Terminal that is closest to the right
 //              - These are "hard" to program, see Yacc and Bison
 
+#include <llvm/IR/Module.h>
 #include <llvm/IR/Value.h>
+#include <llvm/IR/IRBuilder.h>
 #include <iostream>
 #include <cassert>
 #include <map>
 #include <memory>
 #include <variant>
 #include <vector>
+
+/////////////////////////////////////////////
+////////////// LLVM related //////////////
+/////////////////////////////////////////////
+
+static std::unique_ptr<llvm::LLVMContext> TheContext;
+static std::unique_ptr<llvm::IRBuilder<>> Builder;
+static std::unique_ptr<llvm::Module> TheModule;
+static std::map<std::string, llvm::Value*> NamedValues;
 
 /////////////////////////////////////////////
 ////////////// Lexer (Scanner) //////////////
@@ -168,15 +179,20 @@ static TokenOrAsciiCharacter AdvanceToNextToken()
     return CurrentToken = GetNextToken();
 }
 
-// ====================================================================================
-// ====================================================================================
-// ====================================================================================
+/////////////////////////////////////////////
+//////// Abstract Syntax Tree tpes //////////
+/////////////////////////////////////////////
+
+
+
+llvm::Value* LogErrorV(const char* Str);
 
 // Base class for all expression nodes.
 class ExpressionAST
 {
 public:
     virtual ~ExpressionAST() = default;
+    virtual llvm::Value* CodeGen() = 0; // Generates IR for LLVM, see: https://llvm.org/doxygen/classllvm_1_1Value.html
 };
 
 // Expression class for numeric literals like "1.0".
@@ -187,16 +203,33 @@ public:
     explicit NumberExpressionAST(const double InValue)
         : Value(InValue)
     {}
+
+    llvm::Value* CodeGen() override
+    {
+        return llvm::ConstantFP::get(*TheContext, llvm::APFloat(Value));;
+    }
 };
 
 // Expression class for referencing a variable, like "a".
 class VariableExpressionAST final : public ExpressionAST
 {
     std::string Name;
+
     public:
         explicit VariableExpressionAST(std::string&& InValue)
             : Name(std::move(InValue))
     {}
+
+    llvm::Value* CodeGen() override
+    {
+        // Look this variable up in the function.
+        if (const auto Found = NamedValues.find(Name);
+            Found != NamedValues.end())
+        {
+            return Found->second;
+        }
+        return LogErrorV("Unknown variable name");
+    }
 };
 
 // Expression class representing a binary operation like a + b
@@ -214,6 +247,34 @@ public:
         , LeftHandSide(std::move(InLeftHandSide))
         , RightHandSide(std::move(InRightHandSide))
     {}
+    
+    llvm::Value* CodeGen() override
+    {
+        llvm::Value* Left = LeftHandSide->CodeGen();
+        llvm::Value* Right = RightHandSide->CodeGen();
+        if (!Left || !Right)
+        {
+            return nullptr;
+        }
+
+        switch (Operator) {
+        case '+':
+            return Builder->CreateFAdd(Left, Right, "AddTmp");
+        case '-':
+            return Builder->CreateFSub(Left, Right, "SubTmp");
+        case '*':
+            return Builder->CreateFMul(Left, Right, "MulTmp");
+        case '<':
+            Left = Builder->CreateFCmpULT(Left, Right, "CmpTmp");
+            // Convert bool 0/1 to double 0.0 or 1.0
+            return Builder->CreateUIToFP(
+                Left,
+                llvm::Type::getDoubleTy(*TheContext),
+                "BoolTmp");
+        default:
+            return LogErrorV("invalid binary operator");
+        }
+    }
 };
 
 // Expression class representing a function invocation 
@@ -229,12 +290,36 @@ public:
         : Callee(std::move(InCallee))
         , Arguments(std::move(InArguments))
     {}
+    
+    llvm::Value* CodeGen() override
+    {
+        // Look up the name in the global module table.
+        llvm::Function *CalleeF = TheModule->getFunction(Callee);
+        if (!CalleeF)
+        {
+            return LogErrorV("Unknown function referenced");
+        }
+
+        // If argument mismatch error.
+        if (CalleeF->arg_size() != Arguments.size())
+        {
+            return LogErrorV("Incorrect # arguments passed");
+        }
+
+        std::vector<llvm::Value*> ArgsV;
+        for (const auto& Argument : Arguments)
+        {
+            ArgsV.push_back(Argument->CodeGen());
+            if (!ArgsV.back())
+            {
+                return nullptr;
+            }
+        }
+
+        return Builder->CreateCall(CalleeF, ArgsV, "calltmp");
+    }
 };
 
-
-/////////////////////////////////////////////
-//////// Abstract Syntax Tree types /////////
-/////////////////////////////////////////////
 /**
  * This class represents the "prototype" for a function,
  * which captures its name, and its argument names (thus implicitly the number
@@ -252,7 +337,35 @@ public:
         : Name(InName)
         , Args(std::move(InArgs)) {}
 
-    [[nodiscard]] const std::string& getName() const { return Name; }
+    [[nodiscard]] const std::string& GetName() const { return Name; }
+
+    [[nodiscard]] llvm::Function* CodeGen() const
+    {
+        // Make the function type:  double(double,double) etc.
+        std::vector<llvm::Type*> Doubles(
+            Args.size(),
+            llvm::Type::getDoubleTy(*TheContext));
+        
+        llvm::FunctionType *FunctionType =
+            llvm::FunctionType::get(
+                llvm::Type::getDoubleTy(*TheContext),
+                Doubles,
+                false);
+
+        llvm::Function *Function =
+            llvm::Function::Create(
+                FunctionType,
+                llvm::Function::ExternalLinkage,
+                Name,
+                TheModule.get());
+
+        // Set names for all arguments.
+        unsigned Idx = 0;
+        for (auto& Arg : Function->args())
+            Arg.setName(Args[Idx++]);
+
+        return Function;
+    }
 };
 
 /**
@@ -270,7 +383,74 @@ public:
         : Proto(std::move(InProto))
         , Body(std::move(InBody))
     {}
+
+    [[nodiscard]] llvm::Function* CodeGen() const
+    {
+        // First, check for an existing function from a previous 'extern' declaration.
+        llvm::Function* TheFunction = TheModule->getFunction(Proto->GetName());
+
+        if (!TheFunction)
+        {
+            TheFunction = Proto->CodeGen();
+        }
+
+        if (!TheFunction)
+        {
+            return nullptr;            
+        }
+
+        if (!TheFunction->empty())
+        {
+            return reinterpret_cast<llvm::Function*>(LogErrorV("Function cannot be redefined."));
+        }
+
+        // Create a new basic block to start insertion into.
+        llvm::BasicBlock* BasicBlock = llvm::BasicBlock::Create(
+            *TheContext,
+            "Entry",
+            TheFunction);
+        Builder->SetInsertPoint(BasicBlock);
+
+        // Record the function arguments in the NamedValues map.
+        NamedValues.clear();
+        for (auto& Arg : TheFunction->args())
+        {
+            NamedValues[std::string(Arg.getName())] = &Arg;
+        }
+
+        if (llvm::Value *RetVal = Body->CodeGen()) {
+            // Finish off the function.
+            Builder->CreateRet(RetVal);
+
+            // Validate the generated code, checking for consistency.
+            // VerifyFunction(*TheFunction);
+
+            return TheFunction;
+        }
+
+        // Error reading body, remove function.
+        TheFunction->eraseFromParent();
+        return nullptr;
+    }
 };
+
+std::unique_ptr<ExpressionAST> LogError(const char* Str)
+{
+    fprintf(stderr, "Error: %s\n", Str);
+    return nullptr;
+}
+
+std::unique_ptr<PrototypeAST> LogErrorP(const char* Str)
+{
+    LogError(Str);
+    return nullptr;
+}
+
+llvm::Value* LogErrorV(const char* Str)
+{
+    LogError(Str);
+    return nullptr;
+}
 
 /////////////////////////////////////////////
 ////////////////// Parser ///////////////////
@@ -284,18 +464,6 @@ static std::unique_ptr<ExpressionAST> ParsePrimaryExpression();
 static std::unique_ptr<ExpressionAST> ParseExpression();
 static std::unique_ptr<ExpressionAST> ParsePrimaryExpression();
 static std::unique_ptr<ExpressionAST> ParseBinaryOperationRHS(int ExpressionPrecedence, std::unique_ptr<ExpressionAST> LeftHandSide);
-
-std::unique_ptr<ExpressionAST> LogError(const char* Str)
-{
-    fprintf(stderr, "Error: %s\n", Str);
-    return nullptr;
-}
-
-std::unique_ptr<PrototypeAST> LogErrorP(const char* Str)
-{
-    LogError(Str);
-    return nullptr;
-}
 
 // NumberExpr ::= number
 static std::unique_ptr<ExpressionAST> ParseNumberExpr()
@@ -528,6 +696,16 @@ static std::unique_ptr<PrototypeAST> ParsePrototype()
     return std::make_unique<PrototypeAST>(std::move(FnName), std::move(ArgNames));
 }
 
+static void InitializeModule()
+{
+    // Open a new context and module.
+    TheContext = std::make_unique<llvm::LLVMContext>();
+    TheModule = std::make_unique<llvm::Module>("my cool jit", *TheContext);
+
+    // Create a new builder for the module.
+    Builder = std::make_unique<llvm::IRBuilder<>>(*TheContext);
+}
+
 /// Definition ::= 'def' prototype expression
 static std::unique_ptr<FunctionAST> ParseDefinition()
 {
@@ -589,22 +767,35 @@ static void MainLoop()
 
         if (IsToken(CurrentToken, TokenType::Definition))
         {
-            ParseDefinition();
+            if (const auto FunctionDefinitionAST = ParseDefinition())
+            {
+                FunctionDefinitionAST->CodeGen()->print( llvm::outs());
+                llvm::outs().flush();
+            }
             continue;
         }
         
         if (IsToken(CurrentToken, TokenType::Extern))
         {
-            ParseExtern();
+            if (const auto ExternFunctionAST = ParseExtern())
+            {
+                ExternFunctionAST->CodeGen()->print( llvm::outs());
+                llvm::outs().flush();
+            }
             continue;
         }
 
-        ParseTopLevelExpr();
+        if (const auto TopLevelExpressionAST = ParseTopLevelExpr())
+        {
+            TopLevelExpressionAST->CodeGen()->print( llvm::outs());
+            llvm::outs().flush();
+        }
     }
 }
 
 int main()
 {
+    InitializeModule();
     MainLoop();
     return 0;
 }
