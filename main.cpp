@@ -78,6 +78,8 @@ static llvm::ExitOnError ExitOnErr;
 static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
 static std::map<std::string, std::unique_ptr<class PrototypeAST>> FunctionProtos; // This was intended for having multiple re-definitions of the function but is no longer valid technique as per the tutorial, removing as it just ocmplicates the cod
 
+bool bWaitForNewExpression = false;
+
 /////////////////////////////////////////////
 ////////////// Lexer (Scanner) //////////////
 /////////////////////////////////////////////
@@ -125,9 +127,30 @@ static bool IsToken(const TokenOrAsciiCharacter& Token, const TokenType InTokenT
 
 static char GetNextChar()
 {
-    const int Character = getchar();
+    static size_t Index = -1;
+    static std::string Line;
+
+    // Get the full line instantly
+    if (Index == -1)
+    {
+        std::getline(std::cin, Line);
+        Index = 0;
+    }
+
+    // Ask for the next line
+    if (Index >= Line.size())
+    {
+        Index = -1;
+        Line.clear();
+        return EOF;
+    }
+
+    return Line[Index++];
+
+    // Romu> Not using this from tutorial as I don't want to explicitly pass the EOF character, this in order to behave more like a REPL
+    //const int Character = getchar();
     //assert(Character >= 0 && Character < 128 && "Provided character is not an ascii character");
-    return static_cast<char>(Character);
+    //return static_cast<char>(Character);
 }
 
 /// Return the next token from standard input.
@@ -135,8 +158,9 @@ static TokenOrAsciiCharacter GetNextToken() // Lexer
 {
     // Find next not empty space
     static char LastChar = ' ';
-    while (isspace(LastChar))
+    while (isspace(LastChar) || bWaitForNewExpression)
     {
+        bWaitForNewExpression = false;
         LastChar = GetNextChar();
     }
     
@@ -857,7 +881,7 @@ static void InitializeModuleAndManagers()
     // Create the new pass manager builder.
     // Take a look at the PassBuilder constructor parameters for more
     // customization, e.g. specifying a TargetMachine or various debugging options.
-    llvm::PassBuilder PassBuilder(nullptr, llvm::PipelineTuningOptions(), std::nullopt, ThePassInstrumentationCallback.get());
+    llvm::PassBuilder PassBuilder(nullptr, llvm::PipelineTuningOptions()); //, std::nullopt, ThePassInstrumentationCallback.get());
 
     // Register all the basic analyses with the managers.
     PassBuilder.registerLoopAnalyses(*TheLoopAnalysisManager);
@@ -898,7 +922,8 @@ static void MainLoop()
 
         if (IsToken(CurrentToken, TokenType::EndOfFile))
         {
-            return;
+            bWaitForNewExpression = true;
+            AdvanceToNextToken();
         }
 
         if (IsToken(CurrentToken, ';'))
