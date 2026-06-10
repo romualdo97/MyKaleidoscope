@@ -96,7 +96,12 @@ enum class TokenType : char
 
     // Primary
     Identifier,
-    Number
+    Number,
+
+    // Conditional
+    If,
+    Then,
+    Else
 };
 
 static std::string IdentifierStr; // Filled in if Token::Identifier
@@ -181,6 +186,21 @@ static TokenOrAsciiCharacter GetNextToken() // Lexer
         if (IdentifierStr == "extern")
         {
             return TokenType::Extern;    
+        }
+
+        if (IdentifierStr == "if")
+        {
+            return TokenType::If;
+        }
+
+        if (IdentifierStr == "then")
+        {
+            return TokenType::Then;
+        }
+
+        if (IdentifierStr == "else")
+        {
+            return TokenType::Else;
         }
 
         return TokenType::Identifier;
@@ -382,6 +402,90 @@ public:
     }
 };
 
+/// Expression class for if/then/else.
+class IfExprAST : public ExpressionAST {
+    std::unique_ptr<ExpressionAST> Cond, Then, Else;
+
+public:
+    IfExprAST(
+        std::unique_ptr<ExpressionAST> Cond,
+        std::unique_ptr<ExpressionAST> Then,
+        std::unique_ptr<ExpressionAST> Else) :
+        Cond(std::move(Cond)),
+        Then(std::move(Then)),
+        Else(std::move(Else))
+    {}
+
+    llvm::Value* CodeGen() override
+    {
+        llvm::Value *ConditionValue = Cond->CodeGen();
+        if (!ConditionValue)
+        {
+            return nullptr;
+        }
+
+        // Convert condition to a bool by comparing non-equal to 0.0.
+        ConditionValue = Builder->CreateFCmpONE(
+            /*LHS*/ ConditionValue,
+            /*RHS*/ llvm::ConstantFP::get(
+                *TheContext,
+                llvm::APFloat(0.0)),
+                "IfCondition");
+
+        llvm::Function* TheFunction = Builder->GetInsertBlock()->getParent();
+
+        // Create blocks for the then and else cases.  Insert the 'then' block at the
+        // end of the function.
+        llvm::BasicBlock *ThenBlock = llvm::BasicBlock::Create(*TheContext, "Then", TheFunction);
+        llvm::BasicBlock *ElseBlock = llvm::BasicBlock::Create(*TheContext, "Else");
+        llvm::BasicBlock *MergeBlock = llvm::BasicBlock::Create(*TheContext, "IfContinuation");
+
+        Builder->CreateCondBr(ConditionValue, ThenBlock, ElseBlock);
+
+        // Emit then value.
+        Builder->SetInsertPoint(ThenBlock);
+
+        llvm::Value* ThenValue = Then->CodeGen();
+        if (!ThenValue)
+        {
+            return nullptr;
+        }
+
+        Builder->CreateBr(MergeBlock);
+        
+        // Codegen of 'Then' can change the current block, update ThenBlock for the PHI.
+        ThenBlock = Builder->GetInsertBlock();
+
+        // Emit else block.
+        TheFunction->insert(TheFunction->end(), ElseBlock);
+        Builder->SetInsertPoint(ElseBlock);
+
+        llvm::Value* ElseValue = Else->CodeGen();
+        if (!ElseValue)
+        {
+            return nullptr;
+        }
+
+        Builder->CreateBr(MergeBlock);
+
+        // Codegen of 'Else' can change the current block, update ElseBB for the PHI.
+        ElseBlock = Builder->GetInsertBlock();
+        
+        // Emit merge block.
+        TheFunction->insert(TheFunction->end(), MergeBlock);
+        Builder->SetInsertPoint(MergeBlock);
+        llvm::PHINode* PhiBlock =
+          Builder->CreatePHI(
+              llvm::Type::getDoubleTy(
+                  *TheContext),
+                  2,
+                  "IfTmp");
+
+        PhiBlock->addIncoming(ThenValue, ThenBlock);
+        PhiBlock->addIncoming(ElseValue, ElseBlock);
+        return PhiBlock;
+    }
+};
 /**
  * This class represents the "prototype" for a function,
  * which captures its name, and its argument names (thus implicitly the number
@@ -630,6 +734,48 @@ static std::unique_ptr<ExpressionAST> ParseIdentifierExpr()
     AdvanceToNextToken();
     return std::make_unique<CallExpressionAST>(std::move(NameId), std::move(Args));
 }
+
+// 
+/**
+ * Romu> Represents an if/then/else expression
+ * IfExpr ::= 'if' expression 'then' expression 'else' expression
+ */
+static std::unique_ptr<ExpressionAST> ParseIfExpression()
+{
+    AdvanceToNextToken(); // Eat the `if`
+    auto Condition = ParseExpression();
+    if (!Condition)
+    {
+        return nullptr;
+    }
+
+    if (!IsToken(CurrentToken, TokenType::Then))
+    {
+        return LogError("Expected then");
+    }
+    AdvanceToNextToken(); // Eat the `then`
+
+    auto Then = ParseExpression(); 
+    if (!Then)
+    {
+        return nullptr;        
+    }
+    
+    if (!IsToken(CurrentToken, TokenType::Else))
+    {
+        return LogError("Expected then");
+    }
+    AdvanceToNextToken(); // Eat the `else`
+
+    auto Else = ParseExpression();
+    if (!Else)
+    {
+        return nullptr;
+    }
+    
+    return std::make_unique<IfExprAST>(std::move(Condition), std::move(Then), std::move(Else));
+}
+
 // Operator precedence parsing
 
 // This holds the precedence for each binary operator that is  defined.
@@ -752,6 +898,11 @@ static std::unique_ptr<ExpressionAST> ParsePrimaryExpression()
     if (IsToken(CurrentToken, '('))
     {
         return ParseParenthesisExpr();
+    }
+
+    if (IsToken(CurrentToken, TokenType::If))
+    {
+        return ParseIfExpression();
     }
 
     return LogError("Unknown token when expecting an expression");
