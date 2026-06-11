@@ -67,7 +67,6 @@ static std::unique_ptr<llvm::CGSCCAnalysisManager> TheCallGraphAnalysisManager;
 static std::unique_ptr<llvm::ModuleAnalysisManager> TheModuleAnalysisManager;
 static std::unique_ptr<llvm::FunctionPassManager> TheFunctionPassManager;
 
-
 // For logging
 static std::unique_ptr<llvm::PassInstrumentationCallbacks> ThePassInstrumentationCallback;
 static std::unique_ptr<llvm::StandardInstrumentations> TheStandardInstrumentation;
@@ -101,7 +100,11 @@ enum class TokenType : char
     // Conditional
     If,
     Then,
-    Else
+    Else,
+
+    // Loop
+    For,
+    In    
 };
 
 static std::string IdentifierStr; // Filled in if Token::Identifier
@@ -201,6 +204,16 @@ static TokenOrAsciiCharacter GetNextToken() // Lexer
         if (IdentifierStr == "else")
         {
             return TokenType::Else;
+        }
+
+        if (IdentifierStr == "for")
+        {
+            return TokenType::For;
+        }
+
+        if (IdentifierStr == "in")
+        {
+            return TokenType::In;
         }
 
         return TokenType::Identifier;
@@ -486,6 +499,142 @@ public:
         return PhiBlock;
     }
 };
+
+/**
+ * Expression class representing for/in loops
+ */
+class ForExprAST final : public ExpressionAST {
+    std::string VarName;
+    std::unique_ptr<ExpressionAST> Start, End, Step, Body;
+
+public:
+    ForExprAST(
+        std::string&& VarName,
+        std::unique_ptr<ExpressionAST> Start,
+        std::unique_ptr<ExpressionAST> End,
+        std::unique_ptr<ExpressionAST> Step,
+        std::unique_ptr<ExpressionAST> Body) :
+        VarName(std::move(VarName)),
+        Start(std::move(Start)),
+        End(std::move(End)),
+        Step(std::move(Step)),
+        Body(std::move(Body))
+    {}
+
+    llvm::Value *CodeGen() override
+    {
+        // Emit the start code first, without 'variable' in scope.
+        llvm::Value* StartVal = Start->CodeGen();
+        if (!StartVal)
+        {
+            return nullptr;
+        }
+
+        // Make the new basic block for the loop header, inserting after current
+        // block.
+        llvm::Function* TheFunction = Builder->GetInsertBlock()->getParent();
+        llvm::BasicBlock* PreheaderBlock = Builder->GetInsertBlock();
+        llvm::BasicBlock* LoopBlock = llvm::BasicBlock::Create(
+            *TheContext,
+            "Loop",
+            TheFunction);
+
+        // Insert an explicit fall through from the current block to the LoopBB.
+        Builder->CreateBr(LoopBlock);
+
+        // Start insertion in LoopBB.
+        Builder->SetInsertPoint(LoopBlock);
+
+        // Start the PHI node with an entry for Start.
+        llvm::PHINode* Variable = Builder->CreatePHI(
+            llvm::Type::getDoubleTy(*TheContext),
+            2,
+            VarName);
+        Variable->addIncoming(StartVal, PreheaderBlock);
+
+        // Within the loop, the variable is defined equal to the PHI node.  If it
+        // shadows an existing variable, we have to restore it, so save it now.
+        llvm::Value* OldVal = NamedValues[VarName];
+        NamedValues[VarName] = Variable;
+
+        // Emit the body of the loop. This, like any other expr, can change the
+        // current BB.  Note that we ignore the value computed by the body, but don't
+        // allow an error.
+        if (!Body->CodeGen())
+        {
+            return nullptr;
+        }
+        
+        // Emit the step value.
+        llvm::Value* StepVal = nullptr;
+        if (Step)
+        {
+            StepVal = Step->CodeGen();
+            if (!StepVal)
+            {
+                return nullptr;
+            }
+        }
+        else
+        {
+            // If not specified, use 1.0.
+            StepVal = llvm::ConstantFP::get(
+                *TheContext,
+                llvm::APFloat(1.0));
+        }
+
+        llvm::Value* NextVar = Builder->CreateFAdd(
+            Variable,
+            StepVal,
+            "NextVar");
+
+        // Compute the end condition.
+        llvm::Value* EndCond = End->CodeGen();
+        if (!EndCond)
+        {
+            return nullptr;
+        }
+
+        // Convert condition to a bool by comparing non-equal to 0.0.
+        EndCond = Builder->CreateFCmpONE(
+            EndCond,
+            llvm::ConstantFP::get(
+                *TheContext,
+                llvm::APFloat(0.0)),
+            "CoopCond");
+
+        // Create the "after loop" block and insert it.
+        llvm::BasicBlock* LoopEndBlock = Builder->GetInsertBlock();
+        llvm::BasicBlock* AfterBlock =
+            llvm::BasicBlock::Create(
+                *TheContext,
+                "AfterLoop",
+                TheFunction);
+
+        // Insert the conditional branch into the end of LoopEndBB.
+        Builder->CreateCondBr(EndCond, LoopBlock, AfterBlock);
+
+        // Any new code will be inserted in AfterBB.
+        Builder->SetInsertPoint(AfterBlock);
+
+        // Add a new entry to the PHI node for the back-edge.
+        Variable->addIncoming(NextVar, LoopEndBlock);
+
+        // Restore the unshadowed variable.
+        if (OldVal)
+        {
+            NamedValues[VarName] = OldVal;
+        }
+        else
+        {
+            NamedValues.erase(VarName);
+        }
+
+        // for expr always returns 0.0.
+        return llvm::Constant::getNullValue(llvm::Type::getDoubleTy(*TheContext));
+    }
+};
+
 /**
  * This class represents the "prototype" for a function,
  * which captures its name, and its argument names (thus implicitly the number
@@ -589,7 +738,7 @@ public:
             // VerifyFunction(*TheFunction);
 
             // Optimize the generated IL code
-            TheFunctionPassManager->run(*TheFunction, *TheFunctionAnalysisManager);
+            //TheFunctionPassManager->run(*TheFunction, *TheFunctionAnalysisManager);
 
             return TheFunction;
         }
@@ -735,12 +884,11 @@ static std::unique_ptr<ExpressionAST> ParseIdentifierExpr()
     return std::make_unique<CallExpressionAST>(std::move(NameId), std::move(Args));
 }
 
-// 
 /**
  * Romu> Represents an if/then/else expression
  * IfExpr ::= 'if' expression 'then' expression 'else' expression
  */
-static std::unique_ptr<ExpressionAST> ParseIfExpression()
+static std::unique_ptr<ExpressionAST> ParseIfExpr()
 {
     AdvanceToNextToken(); // Eat the `if`
     auto Condition = ParseExpression();
@@ -774,6 +922,78 @@ static std::unique_ptr<ExpressionAST> ParseIfExpression()
     }
     
     return std::make_unique<IfExprAST>(std::move(Condition), std::move(Then), std::move(Else));
+}
+
+/**
+ * Romu> A for loop formed by three parts `StartBlock; StepBlock in EndBlock`, the formal grammar is defined as:
+ * ForExpr ::= 'for' identifier '=' Expression ';' Expression (',' Expression)? 'in' Expression
+ */
+static std::unique_ptr<ExpressionAST> ParseForExpr()
+{
+    AdvanceToNextToken(); // Eat the for.
+
+    if (!IsToken(CurrentToken, TokenType::Identifier))
+    {
+        return LogError("Expected identifier after `for`");
+    }
+
+    std::string IdName = IdentifierStr;
+    AdvanceToNextToken();  // Eat identifier.
+
+    if (!IsToken(CurrentToken, '='))
+    {
+        return LogError("Expected `=` after `identifier` in `for` loop");
+    }
+    AdvanceToNextToken(); // Eat `=`
+
+    std::unique_ptr<ExpressionAST> StartExpression = ParseExpression();
+    if (!StartExpression)
+    {
+        return nullptr;
+    }
+
+    if (!IsToken(CurrentToken, ';'))
+    {
+        return LogError("Expected ';' after `for Identifier = Expression` loop");
+    }
+    AdvanceToNextToken(); // Eat the `;`
+    
+    std::unique_ptr<ExpressionAST> EndExpression = ParseExpression();
+    if (!EndExpression)
+    {
+        return nullptr;
+    }
+
+    // The step value is optional.
+    std::unique_ptr<ExpressionAST> StepExpression;
+    if (IsToken(CurrentToken, ';'))
+    {
+        AdvanceToNextToken(); // Eat the ';'
+        StepExpression = ParseExpression();
+        if (!StepExpression)
+        {
+            return nullptr;
+        }
+    }
+
+    if (!IsToken(CurrentToken, TokenType::In))
+    {
+        return LogError("Expected `in` after `for`");
+    }
+    AdvanceToNextToken(); // Eat the 'in'
+
+    std::unique_ptr<ExpressionAST> BodyExpression = ParseExpression();
+    if (!BodyExpression)
+    {
+        return nullptr;
+    }
+
+    return std::make_unique<ForExprAST>(
+        std::move(IdName),
+        std::move(StartExpression),
+        std::move(EndExpression),
+        std::move(StepExpression),
+        std::move(BodyExpression));
 }
 
 // Operator precedence parsing
@@ -882,6 +1102,8 @@ static std::unique_ptr<ExpressionAST> ParseBinaryOperationRHS(int ExpressionPrec
  *   ::= IdentifierExpr
  *   ::= NumberExpr
  *   ::= ParenthesisExpr
+ *   ::= IfExpr
+ *   ::= ForExpr
  */
 static std::unique_ptr<ExpressionAST> ParsePrimaryExpression()
 {
@@ -902,7 +1124,12 @@ static std::unique_ptr<ExpressionAST> ParsePrimaryExpression()
 
     if (IsToken(CurrentToken, TokenType::If))
     {
-        return ParseIfExpression();
+        return ParseIfExpr();
+    }
+
+    if (IsToken(CurrentToken, TokenType::For))
+    {
+        return ParseForExpr();
     }
 
     return LogError("Unknown token when expecting an expression");
@@ -1054,7 +1281,6 @@ static void InitializeModuleAndManagers()
     TheFunctionPassManager->addPass(llvm::GVNPass());
     // Simplify the control flow graph (deleting unreachable blocks, etc...).
     TheFunctionPassManager->addPass(llvm::SimplifyCFGPass());
-
 }
 
 /**
