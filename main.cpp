@@ -1540,8 +1540,17 @@ static void MainLoop()
 #endif
 
 // that takes a double and returns 0.
-extern "C" DLLEXPORT double PrintDouble(const double Number) {
-    fputc(static_cast<char>(Number), stderr);
+/// putchard - putchar that takes a double and returns 0.
+extern "C" DLLEXPORT double putchard(double X)
+{
+    fputc(static_cast<char>(X), stderr);
+    return 0;
+}
+
+/// printd - printf that takes a double prints it as "%f\n", returning 0.
+extern "C" DLLEXPORT double printd(double X)
+{
+    fprintf(stderr, "%f\n", X);
     return 0;
 }
 
