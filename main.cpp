@@ -77,6 +77,16 @@ static llvm::ExitOnError ExitOnErr;
 static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
 static std::map<std::string, std::unique_ptr<class PrototypeAST>> FunctionProtos; // This was intended for having multiple re-definitions of the function but is no longer valid technique as per the tutorial, removing as it just ocmplicates the cod
 
+// This holds the precedence for each binary operator that is pre-defined by the language.
+static std::map<char, int> BinaryOperatorPrecedence
+{
+    { '<', 10 },
+    { '+', 20 },
+    { '-', 20 },
+    { '*', 30 },
+    { '/', 30 }
+};
+
 bool bWaitForNewExpression = false;
 
 /////////////////////////////////////////////
@@ -104,7 +114,11 @@ enum class TokenType : char
 
     // Loop
     For,
-    In    
+    In,
+
+    // User defined operators
+    UnaryOperator,
+    BinaryOperator,
 };
 
 static std::string IdentifierStr; // Filled in if Token::Identifier
@@ -216,6 +230,16 @@ static TokenOrAsciiCharacter GetNextToken() // Lexer
             return TokenType::In;
         }
 
+        if (IdentifierStr == "unary")
+        {
+            return TokenType::UnaryOperator;
+        }
+
+        if (IdentifierStr == "binary")
+        {
+            return TokenType::BinaryOperator;
+        }
+
         return TokenType::Identifier;
     }
 
@@ -321,6 +345,8 @@ class VariableExpressionAST final : public ExpressionAST
     }
 };
 
+llvm::Function* GetFunction(const std::string& Name);
+
 /// Expression class representing a binary operation like a + b
 class BinaryExpressionAST final : public ExpressionAST
 {
@@ -353,6 +379,8 @@ public:
             return Builder->CreateFSub(Left, Right, "SubTmp");
         case '*':
             return Builder->CreateFMul(Left, Right, "MulTmp");
+        case '/':
+            return Builder->CreateFDiv(Left, Right, "DivTmp");
         case '<':
             Left = Builder->CreateFCmpULT(Left, Right, "CmpTmp");
             // Convert bool 0/1 to double 0.0 or 1.0
@@ -361,12 +389,18 @@ public:
                 llvm::Type::getDoubleTy(*TheContext),
                 "BoolTmp");
         default:
-            return LogErrorV("invalid binary operator");
+            break;
         }
+
+        // If it wasn't a builtin binary operator, it must be a user defined one. Emit
+        // a call to it.
+        llvm::Function *Function = GetFunction(std::string("UserDefined_BinaryOperator_") + Operator);
+        assert(Function && "binary operator not found!");
+
+        llvm::Value* Operands[2] = { Left, Right };
+        return Builder->CreateCall(Function, Operands, "CallUserBinaryOperator");
     }
 };
-
-llvm::Function* GetFunction(const std::string& Name);
 
 /// Expression class representing a function invocation 
 class CallExpressionAST final : public ExpressionAST
@@ -639,21 +673,44 @@ public:
  * This class represents the "prototype" for a function,
  * which captures its name, and its argument names (thus implicitly the number
  * of arguments the function takes).
+ *
+ * as well as if it is an operator.
  */
 class PrototypeAST
 {
     std::string Name;
     std::vector<std::string> Args;
-
+    bool IsOperator;
+    unsigned Precedence;  // Precedence if a binary op.
+    
 public:
     PrototypeAST(
         std::string&& InName,
-        std::vector<std::string> InArgs)
-        : Name(InName)
-        , Args(std::move(InArgs)) {}
+        std::vector<std::string> InArgs,
+        bool InIsOperator,
+        unsigned InPrecedence)
+        : Name(std::move(InName))
+        , Args(std::move(InArgs))
+        , IsOperator(InIsOperator)
+        , Precedence(InPrecedence) {}
 
     [[nodiscard]] const std::string& GetName() const { return Name; }
 
+    [[nodiscard]] bool IsUnaryOp() const { return IsOperator && Args.size() == 1; }
+    [[nodiscard]] bool IsBinaryOp() const { return IsOperator && Args.size() == 2; }
+
+    [[nodiscard]] unsigned GetBinaryOperatorPrecedence() const
+    {
+        assert(IsBinaryOp());
+        return Precedence;
+    }
+    
+    [[nodiscard]] char GetOperatorName() const
+    {
+        assert(IsUnaryOp() || IsBinaryOp());
+        return Name[Name.size() - 1];
+    }
+    
     [[nodiscard]] llvm::Function* CodeGen() const
     {
         // Make the function type:  double(double,double) etc.
@@ -715,6 +772,12 @@ public:
             return reinterpret_cast<llvm::Function*>(LogErrorV("Function cannot be redefined."));
         }
 
+        // If this is an operator, install it.
+        if (Proto->IsBinaryOp())
+        {
+            BinaryOperatorPrecedence[Proto->GetOperatorName()] = Proto->GetBinaryOperatorPrecedence();
+        }
+
         // Create a new basic block to start insertion into.
         llvm::BasicBlock* BasicBlock = llvm::BasicBlock::Create(
             *TheContext,
@@ -738,7 +801,7 @@ public:
             // VerifyFunction(*TheFunction);
 
             // Optimize the generated IL code
-            //TheFunctionPassManager->run(*TheFunction, *TheFunctionAnalysisManager);
+            TheFunctionPassManager->run(*TheFunction, *TheFunctionAnalysisManager);
 
             return TheFunction;
         }
@@ -757,8 +820,8 @@ llvm::Function* GetFunction(const std::string& Name)
 
     // If not, check whether we can codegen the declaration from some existing
     // prototype.
-    auto FunctionPrototype = FunctionProtos.find(Name);
-    if (FunctionPrototype != FunctionProtos.end())
+    if (const auto FunctionPrototype = FunctionProtos.find(Name);
+        FunctionPrototype != FunctionProtos.end())
         return FunctionPrototype->second->CodeGen();
 
     // If no existing prototype exists, return null.
@@ -998,16 +1061,6 @@ static std::unique_ptr<ExpressionAST> ParseForExpr()
 
 // Operator precedence parsing
 
-// This holds the precedence for each binary operator that is  defined.
-static const std::map<char, int> BinaryOperatorPrecedence
-{
-    { '<', 10 },
-    { '+', 20 },
-    { '-', 20 },
-    { '*', 30 },
-    { '/', 30 }
-};
-
 static int GetTokenPrecedence()
 {
     if (!IsTokenChar(CurrentToken)) // When token is a known TokenType, precedence is ignored
@@ -1137,24 +1190,61 @@ static std::unique_ptr<ExpressionAST> ParsePrimaryExpression()
 
 /**
  * Romu> Declares the prototype of the function, this indicates the function name and the name of the parameters
+ * 
  * Prototype
+ * 
  *     ::= id '(' id* ')'
+ *     
+ *     ::= binary LETTER number? (id, id)
+ *
  */
 static std::unique_ptr<PrototypeAST> ParsePrototype()
 {
-    if (!IsToken(CurrentToken, TokenType::Identifier))
+    std::string FnName;
+    unsigned Kind = 0; // 0 = identifier, 1 = unary, 2 = binary.
+    unsigned BinaryPrecedence = 30;
+
+    if (IsToken(CurrentToken, TokenType::Identifier))
+    {
+        FnName = IdentifierStr;
+        Kind = 0;
+        AdvanceToNextToken();
+    }
+    else if (IsToken(CurrentToken, TokenType::BinaryOperator))
+    {
+        AdvanceToNextToken();
+        if (!IsTokenChar(CurrentToken))
+        {
+            return LogErrorP("Expected binary operator");
+        }
+
+        FnName = "UserDefined_BinaryOperator_";
+        FnName += std::get<char>(CurrentToken);
+        Kind = 2;
+        AdvanceToNextToken();
+
+        // Read the precedence if present.
+        if (IsToken(CurrentToken, TokenType::Number))
+        {
+            if (NumVal < 1 || NumVal > 100)
+            {
+                return LogErrorP("Invalid precedence: must be 1..100");
+            }
+
+            BinaryPrecedence = static_cast<unsigned>(NumVal);
+            AdvanceToNextToken();
+        }
+    }
+    else
     {
         return LogErrorP("Expected function name in prototype");
     }
 
-    std::string FnName = std::move(IdentifierStr);
-    AdvanceToNextToken();
-
     if (!IsToken(CurrentToken, '('))
     {
-        return LogErrorP("Expected '(' in prototype");
+        return LogErrorP("Expected '(' in prototype");        
     }
-
+    
     // Read the list of argument names.
     std::vector<std::string> ArgNames;
     while (IsToken(AdvanceToNextToken(), TokenType::Identifier))
@@ -1178,7 +1268,12 @@ static std::unique_ptr<PrototypeAST> ParsePrototype()
     // Success: Eat ')'
     AdvanceToNextToken();
 
-    return std::make_unique<PrototypeAST>(std::move(FnName), std::move(ArgNames));
+    if (Kind == 2 && ArgNames.size() != 2)
+    {
+        return LogErrorP("Expected two arguments for user defined binary operator");
+    }
+
+    return std::make_unique<PrototypeAST>(std::move(FnName), std::move(ArgNames), /*bInIsOperator*/ Kind != 0, BinaryPrecedence);
 }
 
 /**
@@ -1225,7 +1320,7 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr()
     if (auto Expression = ParseExpression())
     {
         // Make an anonymous proto.
-        auto Proto = std::make_unique<PrototypeAST>("__AnonymousExpression", std::vector<std::string>());
+        auto Proto = std::make_unique<PrototypeAST>("__AnonymousExpression", std::vector<std::string>(), /*bInIsOperator*/ false, /*InPrecedence*/ 1);
         return std::make_unique<FunctionAST>(std::move(Proto), std::move(Expression));
     }
     return nullptr;
@@ -1367,9 +1462,9 @@ static void MainLoop()
 #define DLLEXPORT
 #endif
 
-/// putchard - putchar that takes a double and returns 0.
-extern "C" DLLEXPORT double putchard(double X) {
-    fputc((char)X, stderr);
+// that takes a double and returns 0.
+extern "C" DLLEXPORT double PrintDouble(const double Number) {
+    fputc(static_cast<char>(Number), stderr);
     return 0;
 }
 
