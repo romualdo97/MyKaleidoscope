@@ -402,6 +402,37 @@ public:
     }
 };
 
+//  Expression class for a unary operator.
+class UnaryExpressionAST final : public ExpressionAST
+{
+    char Operator;
+    std::unique_ptr<ExpressionAST> Operand;
+
+public:
+    UnaryExpressionAST(
+        const char InOperator,
+        std::unique_ptr<ExpressionAST> InOperand) :
+        Operator(InOperator),
+        Operand(std::move(InOperand)) {}
+
+    llvm::Value *CodeGen() override
+    {
+        llvm::Value *OperandV = Operand->CodeGen();
+        if (!OperandV)
+        {
+            return nullptr;
+        }
+
+        llvm::Function* Function = GetFunction(std::string("UserDefined_UnaryOperator_") + Operator);
+        if (!Function)
+        {
+            return LogErrorV("Unknown unary operator");
+        }
+
+        return Builder->CreateCall(Function, OperandV, "CallUserUnaryOperator");
+    }
+};
+
 /// Expression class representing a function invocation 
 class CallExpressionAST final : public ExpressionAST
 {
@@ -855,6 +886,7 @@ llvm::Value* LogErrorV(const char* Str)
 // Terminals are camelCase
 
 static std::unique_ptr<ExpressionAST> ParsePrimaryExpression();
+static std::unique_ptr<ExpressionAST> ParseUnaryExpression();
 static std::unique_ptr<ExpressionAST> ParseExpression();
 static std::unique_ptr<ExpressionAST> ParseBinaryOperationRHS(int ExpressionPrecedence, std::unique_ptr<ExpressionAST> LeftHandSide);
 
@@ -1075,13 +1107,13 @@ static int GetTokenPrecedence()
 }
 
 /**
- * Romu> Parses a PrimaryExpression optionally followed by a BinaryOperationRHS
+ * Romu> Parses a UnaryExpression (which is a token that can decay into a PrimaryExpression) optionally followed by a BinaryOperationRHS
  * Expression
- *     ::= PrimaryExpression BinaryOperationRHS
+ *     ::= UnaryExpression BinaryOperationRHS
  */
 static std::unique_ptr<ExpressionAST> ParseExpression()
 {
-    auto LeftHandSide = ParsePrimaryExpression();
+    auto LeftHandSide = ParseUnaryExpression();
 
     // No expression, we just return null
     if (!LeftHandSide)
@@ -1095,7 +1127,7 @@ static std::unique_ptr<ExpressionAST> ParseExpression()
 /**
  * Romu> Receives the left hand side operand of a binary operation and check if a binary operator and an Expression is followed, if yes then return the AST node for the binary expression
  * BinaryOperationRHS
- *   ::= ('+' Expression)*
+ *   ::= ('+' UnaryExpression)*
  */
 static std::unique_ptr<ExpressionAST> ParseBinaryOperationRHS(int ExpressionPrecedence, std::unique_ptr<ExpressionAST> LeftHandSide)
 {
@@ -1121,7 +1153,7 @@ static std::unique_ptr<ExpressionAST> ParseBinaryOperationRHS(int ExpressionPrec
         AdvanceToNextToken();  // eat BinaryOperator
 
         // Parse the primary Expression after the BinaryOperator.
-        auto RightHandSide = ParsePrimaryExpression();
+        auto RightHandSide = ParseUnaryExpression(); // UnaryExpression can decay into a PrimaryExpression
         if (!RightHandSide)
         {
             return nullptr;
@@ -1189,11 +1221,43 @@ static std::unique_ptr<ExpressionAST> ParsePrimaryExpression()
 }
 
 /**
+ * Romu> Parses grammar that defines unary operators like ~a where ~ is the operator
+ *
+ * UnaryExpression
+ *
+ *      ::= PrimaryExpression
+ *
+ *      ::= '!' unary
+ */
+static std::unique_ptr<ExpressionAST> ParseUnaryExpression()
+{
+    // If the current token is not an operator, it must be a primary expr.
+    if (!IsTokenChar(CurrentToken) || IsToken(CurrentToken, '(') || IsToken(CurrentToken, ','))
+    {
+        return ParsePrimaryExpression(); // This breaks the UnaryExpression recursion
+    }
+
+    // If this is a unary operator, read it.
+    char Operator = std::get<char>(CurrentToken);
+    AdvanceToNextToken();
+
+    // Parse the expression following the unary operator
+    if (auto Operand = ParseUnaryExpression())
+    {
+        return std::make_unique<UnaryExpressionAST>(Operator, std::move(Operand));
+    }
+
+    return nullptr;
+}
+
+/**
  * Romu> Declares the prototype of the function, this indicates the function name and the name of the parameters
  * 
  * Prototype
  * 
  *     ::= id '(' id* ')'
+ *
+ *     ::= unary LETTER (id)
  *     
  *     ::= binary LETTER number? (id, id)
  *
@@ -1208,6 +1272,19 @@ static std::unique_ptr<PrototypeAST> ParsePrototype()
     {
         FnName = IdentifierStr;
         Kind = 0;
+        AdvanceToNextToken();
+    }
+    else if (IsToken(CurrentToken, TokenType::UnaryOperator))
+    {
+        AdvanceToNextToken();
+        if (!IsTokenChar(CurrentToken))
+        {
+            return LogErrorP("Expected unary operator");
+        }
+        
+        FnName = "UserDefined_UnaryOperator_";
+        FnName += std::get<char>(CurrentToken);
+        Kind = 1;
         AdvanceToNextToken();
     }
     else if (IsToken(CurrentToken, TokenType::BinaryOperator))
@@ -1268,9 +1345,9 @@ static std::unique_ptr<PrototypeAST> ParsePrototype()
     // Success: Eat ')'
     AdvanceToNextToken();
 
-    if (Kind == 2 && ArgNames.size() != 2)
+    if (Kind && ArgNames.size() != Kind)
     {
-        return LogErrorP("Expected two arguments for user defined binary operator");
+        return LogErrorP("Incorrect number of arguments for user defined operator");
     }
 
     return std::make_unique<PrototypeAST>(std::move(FnName), std::move(ArgNames), /*bInIsOperator*/ Kind != 0, BinaryPrecedence);
