@@ -25,19 +25,22 @@
 //          - Rightmost: Replace first the Non-Terminal that is closest to the right
 //              - These are "hard" to program, see Yacc and Bison
 
-#include "llvm/Support/TargetSelect.h"
-#include "llvm/MC/TargetRegistry.h"
-#include "llvm/Target/TargetMachine.h"
-#include "llvm/Support/Error.h"
+#include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/MC/TargetRegistry.h>
+#include <llvm/Target/TargetMachine.h>
+#include <llvm/Support/Error.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Value.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/Passes/PassBuilder.h>
-#include "llvm/Passes/StandardInstrumentations.h"
+#include <llvm/Passes/StandardInstrumentations.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar/Reassociate.h>
 #include <llvm/Transforms/Scalar/GVN.h>
+#include "llvm/Transforms/Utils/Cloning.h"
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Analysis/LoopAnalysisManager.h>
 #include <llvm/Analysis/CGSCCPassManager.h>
@@ -749,13 +752,13 @@ public:
             Args.size(),
             llvm::Type::getDoubleTy(*TheContext));
         
-        llvm::FunctionType *FunctionType =
+        llvm::FunctionType* FunctionType =
             llvm::FunctionType::get(
                 llvm::Type::getDoubleTy(*TheContext),
                 Doubles,
                 false);
 
-        llvm::Function *Function =
+        llvm::Function* Function =
             llvm::Function::Create(
                 FunctionType,
                 llvm::Function::ExternalLinkage,
@@ -800,7 +803,12 @@ public:
 
         if (!TheFunction->empty())
         {
-            return reinterpret_cast<llvm::Function*>(LogErrorV("Function cannot be redefined."));
+            fprintf(stdout, "%s\n", "Function previously defined, re-defining....");
+            fflush(stdout);
+            TheFunction->eraseFromParent();
+            // Re-generating so we allow parameter change, if we only invoked TheFunction->deleteBody()
+            // then function redefinition should keep the same parameter count and respective names  (aka function prototype)
+            TheFunction = Proto->CodeGen();  
         }
 
         // If this is an operator, install it.
@@ -1455,8 +1463,27 @@ static void InitializeModuleAndManagers()
     TheFunctionPassManager->addPass(llvm::SimplifyCFGPass());
 }
 
+llvm::orc::ThreadSafeModule CreateSafeModuleClone()
+{
+    // Serialize the module so we can de-serialize it later and generate a new context
+    std::string BitcodeBuffer;
+    llvm::raw_string_ostream OutputStream(BitcodeBuffer);
+    llvm::WriteBitcodeToFile(*TheModule, OutputStream);
+    OutputStream.flush(); // Not really needed as raw_string_ostream is just an adapter and memory is managed by std::string
+
+    // Load the serialized buffer
+    auto BufferPtr = llvm::MemoryBuffer::getMemBuffer(BitcodeBuffer);
+    
+    // Parse the loaded buffer and store the new context data into the NewContext
+    std::unique_ptr<llvm::LLVMContext> NewContext = std::make_unique<llvm::LLVMContext>();
+    std::unique_ptr<llvm::Module> NewModule = ExitOnErr(llvm::parseBitcodeFile(*BufferPtr, *NewContext));    
+
+    return {std::move(NewModule), std::move(NewContext)};
+}
+
 /**
  * Romu> The starting symbol of the grammar
+ * 
  * Top
  *     ::= Definition | Extern | TopLevelExpr | ';'
  */
@@ -1511,10 +1538,7 @@ static void MainLoop()
                 // Create a ResourceTracker to track JIT'd memory allocated to our
                 // anonymous expression -- that way we can free it after executing.
                 auto ResourceTracker = TheJIT->getMainJITDylib().createResourceTracker();
-
-                auto ThreadSafeModule = llvm::orc::ThreadSafeModule(std::move(TheModule), std::move(TheContext));
-                ExitOnErr(TheJIT->addModule(std::move(ThreadSafeModule), ResourceTracker));
-                InitializeModuleAndManagers();
+                ExitOnErr(TheJIT->addModule(CreateSafeModuleClone(), ResourceTracker));
 
                 // Search the JIT for the __anon_expr symbol.
                 auto ExprSymbol = ExitOnErr(TheJIT->lookup("__AnonymousExpression"));
